@@ -351,7 +351,10 @@ async function scheduled(
   // 以前はアカウントごとにループしていたが、アカウントフィルタなしのDBクエリで
   // 全アカウントの配信が各ループで重複実行されていたバグを修正
   const jobs = [];
-  const maxSendsPerCron = env.MAX_SENDS_PER_CRON ? Number(env.MAX_SENDS_PER_CRON) : undefined;
+  // Guard against malformed config (e.g. MAX_SENDS_PER_CRON="abc" → NaN would
+  // make `sendCount < NaN` always false and silently halt all step delivery).
+  const parsedMaxSends = env.MAX_SENDS_PER_CRON ? Number(env.MAX_SENDS_PER_CRON) : NaN;
+  const maxSendsPerCron = Number.isFinite(parsedMaxSends) && parsedMaxSends > 0 ? parsedMaxSends : undefined;
   jobs.push(
     processStepDeliveries(env.DB, defaultLineClient, env.WORKER_URL, maxSendsPerCron),
     processScheduledBroadcasts(env.DB, defaultLineClient, env.WORKER_URL),

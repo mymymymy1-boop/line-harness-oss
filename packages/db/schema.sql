@@ -26,11 +26,14 @@ CREATE INDEX IF NOT EXISTS idx_friends_ig_igsid ON friends (ig_igsid);
 -- Tags
 -- ============================================================
 CREATE TABLE IF NOT EXISTS tags (
-  id         TEXT PRIMARY KEY,
-  name       TEXT UNIQUE NOT NULL,
-  color      TEXT NOT NULL DEFAULT '#3B82F6',
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
+  id              TEXT PRIMARY KEY,
+  name            TEXT UNIQUE NOT NULL,
+  color           TEXT NOT NULL DEFAULT '#3B82F6',
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  -- Tenant scope. NULL = global tag (visible to all bots, backward-compat). See migration 028.
+  line_account_id TEXT DEFAULT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_tags_account ON tags (line_account_id);
 
 -- ============================================================
 -- Friend <-> Tag join

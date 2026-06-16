@@ -8,9 +8,6 @@ import {
   getScenarios,
   enrollFriendInScenario,
   getScenarioSteps,
-  advanceFriendScenario,
-  completeFriendScenario,
-  claimFriendScenarioForDelivery,
   upsertChatOnMessage,
   getLineAccounts,
   jstNow,
@@ -136,25 +133,21 @@ async function handleEvent(
             const steps = await getScenarioSteps(db, scenario.id);
             const firstStep = steps[0];
             if (firstStep && firstStep.delay_minutes === 0 && friendScenario.status === 'active') {
-              // Finding #2: claim lock でcronとの二重発火を防ぐ
-              // webhook と cron が同じ friend_scenario を同時処理するとstep1が2回送信されるバグを閉じる
-              const claimed = await claimFriendScenarioForDelivery(
+              // claim lock でcronとの二重発火を防ぐ。claim → send → advance/解放 は共有ヘルパーに集約。
+              const { resolveMetadata, deliverImmediateFirstStep } = await import('../services/step-delivery.js');
+              const resolvedMeta = await resolveMetadata(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
+              const expandedContent = expandVariables(firstStep.message_content, { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1]);
+              const message = buildMessage(firstStep.message_type, expandedContent);
+              const result = await deliverImmediateFirstStep(
                 db,
                 friendScenario.id,
                 friendScenario.current_step_order,
-              );
-              if (!claimed) {
-                console.log(`[follow] immediate delivery skipped — already claimed by cron: fs=${friendScenario.id}`);
-              } else {
-                try {
-                  const { resolveMetadata } = await import('../services/step-delivery.js');
-                  const resolvedMeta = await resolveMetadata(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
-                  const expandedContent = expandVariables(firstStep.message_content, { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1]);
-                  const message = buildMessage(firstStep.message_type, expandedContent);
+                firstStep.step_order,
+                steps[1] ?? null,
+                async () => {
                   await lineClient.replyMessage(event.replyToken, [message]);
                   console.log(`Immediate delivery: sent step ${firstStep.id} to ${userId}`);
-
-                  // Log outgoing message (replyMessage = 無料, 非致命)
+                  // Log outgoing message (replyMessage = 無料, 非致命: ログ失敗で再送を招かないよう握りつぶす)
                   try {
                     const logId = crypto.randomUUID();
                     await db
@@ -167,37 +160,10 @@ async function handleEvent(
                   } catch (logErr) {
                     console.error(`[follow] messages_log insert failed fs=${friendScenario.id}:`, logErr);
                   }
-
-                  // Advance or complete the friend_scenario (claim解放も兼ねる: status='active')
-                  const secondStep = steps[1] ?? null;
-                  if (secondStep) {
-                    const nextDeliveryDate = new Date(Date.now() + 9 * 60 * 60_000);
-                    nextDeliveryDate.setMinutes(nextDeliveryDate.getMinutes() + secondStep.delay_minutes);
-                    // Enforce 9:00-21:00 JST delivery window
-                    const h = nextDeliveryDate.getUTCHours();
-                    if (h < 9 || h >= 21) {
-                      if (h >= 21) nextDeliveryDate.setUTCDate(nextDeliveryDate.getUTCDate() + 1);
-                      nextDeliveryDate.setUTCHours(9, 0, 0, 0);
-                    }
-                    await advanceFriendScenario(db, friendScenario.id, firstStep.step_order, nextDeliveryDate.toISOString().slice(0, -1) + '+09:00');
-                  } else {
-                    await completeFriendScenario(db, friendScenario.id);
-                  }
-                } catch (err) {
-                  console.error('Failed immediate delivery for scenario', scenario.id, err);
-                  // Release 'delivering' → 'active' for cron retry 5 分後
-                  try {
-                    const retryDate = new Date(Date.now() + 9 * 60 * 60_000 + 5 * 60 * 1000);
-                    await advanceFriendScenario(
-                      db,
-                      friendScenario.id,
-                      friendScenario.current_step_order,
-                      retryDate.toISOString().slice(0, -1) + '+09:00',
-                    );
-                  } catch (releaseErr) {
-                    console.error(`[follow] failed to release claim fs=${friendScenario.id}:`, releaseErr);
-                  }
-                }
+                },
+              );
+              if (result === 'skipped') {
+                console.log(`[follow] immediate delivery skipped — already claimed by cron: fs=${friendScenario.id}`);
               }
             }
         } catch (err) {

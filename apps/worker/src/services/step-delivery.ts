@@ -109,6 +109,58 @@ function enforceDeliveryWindow(date: Date, preferredHour?: number): Date {
   return result;
 }
 
+/**
+ * Immediate delivery of a scenario's first step (reply on follow, or push on LIFF
+ * registration) with the SAME claim-lock + advance contract the cron uses.
+ *
+ * Why: enrollFriendInScenario sets current_step_order=0 and next_delivery_at≈now,
+ * so if the caller sends step1 immediately WITHOUT advancing, the next cron tick
+ * re-sends step1 → duplicate. This helper closes that window:
+ *   1. claim (active+current_step_order → 'delivering'); if another worker/cron
+ *      already claimed it, returns 'skipped' and the caller must NOT send.
+ *   2. run `send` (caller's reply/push + messages_log insert).
+ *   3. advance to the second step (or complete) — this also releases the claim
+ *      back to 'active'.
+ *   4. on send failure, release the claim back to 'active' (~5 min, windowed) so
+ *      cron retries the same step.
+ *
+ * IMPORTANT: only call `send` when this returns — i.e. invoke the helper and let
+ * it own the send; do not send beforehand.
+ */
+export async function deliverImmediateFirstStep(
+  db: D1Database,
+  friendScenarioId: string,
+  claimStepOrder: number,
+  firstStepOrder: number,
+  secondStep: { delay_minutes: number } | null,
+  send: () => Promise<void>,
+  preferredHour?: number,
+): Promise<'sent' | 'skipped' | 'failed'> {
+  const claimed = await claimFriendScenarioForDelivery(db, friendScenarioId, claimStepOrder);
+  if (!claimed) return 'skipped';
+  try {
+    await send();
+    if (secondStep) {
+      const nextDate = new Date(Date.now() + 9 * 60 * 60_000 + secondStep.delay_minutes * 60_000);
+      const windowed = enforceDeliveryWindow(nextDate, preferredHour);
+      await advanceFriendScenario(db, friendScenarioId, firstStepOrder, windowed.toISOString().slice(0, -1) + '+09:00');
+    } else {
+      await completeFriendScenario(db, friendScenarioId);
+    }
+    return 'sent';
+  } catch (err) {
+    console.error(`[immediate-delivery] send failed fs=${friendScenarioId}:`, err);
+    try {
+      const retryDate = new Date(Date.now() + 9 * 60 * 60_000 + 5 * 60 * 1000);
+      const windowed = enforceDeliveryWindow(retryDate, preferredHour);
+      await advanceFriendScenario(db, friendScenarioId, claimStepOrder, windowed.toISOString().slice(0, -1) + '+09:00');
+    } catch (releaseErr) {
+      console.error(`[immediate-delivery] failed to release claim fs=${friendScenarioId}:`, releaseErr);
+    }
+    return 'failed';
+  }
+}
+
 // Configurable via env: set MAX_SENDS_PER_CRON in wrangler.toml or as secret.
 // CF Free plan: 50 subrequests/invocation → keep ≤40 (margin for other jobs).
 // CF Workers Paid: 1000+ subrequests → safe to raise to 150-300 for higher throughput.

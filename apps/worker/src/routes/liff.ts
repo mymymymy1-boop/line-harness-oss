@@ -707,7 +707,7 @@ liffRoutes.get('/auth/callback', async (c) => {
               // 3) Fresh enrollment + immediate delivery of step 1.
               const { enrollFriendInScenario: enrollEntry, getScenarioSteps: getStepsEntry } = await import('@line-crm/db');
               const { LineClient: LineClientEntry } = await import('@line-crm/line-sdk');
-              const { buildMessage: buildMsgEntry, expandVariables: expandVarsEntry, resolveMetadata: resolveMetaEntry } = await import('../services/step-delivery.js');
+              const { buildMessage: buildMsgEntry, expandVariables: expandVarsEntry, resolveMetadata: resolveMetaEntry, deliverImmediateFirstStep: deliverEntry } = await import('../services/step-delivery.js');
               const enrollment = await enrollEntry(db, friend.id, route.scenario_id);
               if (enrollment) {
                 const steps = await getStepsEntry(db, route.scenario_id);
@@ -726,7 +726,30 @@ liffRoutes.get('/auth/callback', async (c) => {
                     { ...friend, metadata: meta } as Parameters<typeof expandVarsEntry>[1],
                     c.env.WORKER_URL,
                   );
-                  await entryLineClient.pushMessage(lineUserId, [buildMsgEntry(firstStep.message_type, expanded)]);
+                  // Claim + advance so the cron does not re-send step 1 (double-send fix).
+                  await deliverEntry(
+                    db,
+                    enrollment.id,
+                    enrollment.current_step_order,
+                    firstStep.step_order,
+                    steps[1] ?? null,
+                    async () => {
+                      await entryLineClient.pushMessage(lineUserId, [buildMsgEntry(firstStep.message_type, expanded)]);
+                      // messages_log は非致命: ログ失敗で送信失敗扱い→再送を招かないよう握りつぶす
+                      try {
+                        const logId = crypto.randomUUID();
+                        await db
+                          .prepare(
+                            `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, created_at)
+                             VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, ?)`,
+                          )
+                          .bind(logId, friend.id, firstStep.message_type, firstStep.message_content, firstStep.id, jstNow())
+                          .run();
+                      } catch (logErr) {
+                        console.error(`[entry-route] messages_log insert failed fs=${enrollment.id}:`, logErr);
+                      }
+                    },
+                  );
                 }
               }
             }
@@ -844,14 +867,37 @@ liffRoutes.get('/auth/callback', async (c) => {
 
         const enrollment = await enroll(db, friend.id, scenario.id);
         if (enrollment && firstStep && firstStep.delay_minutes === 0) {
-          const { resolveMetadata: resolveMetaLiff } = await import('../services/step-delivery.js');
+          const { resolveMetadata: resolveMetaLiff, deliverImmediateFirstStep: deliverLiff } = await import('../services/step-delivery.js');
           const resolvedMetaLiff = await resolveMetaLiff(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
           const expandedContent = expandVariables(
             firstStep.message_content,
             { ...friend, metadata: resolvedMetaLiff } as Parameters<typeof expandVariables>[1],
             c.env.WORKER_URL,
           );
-          await lineClient.pushMessage(lineUserId, [buildMessage(firstStep.message_type, expandedContent)]);
+          // Claim + advance so the cron does not re-send step 1 (double-send fix).
+          await deliverLiff(
+            db,
+            enrollment.id,
+            enrollment.current_step_order,
+            firstStep.step_order,
+            steps[1] ?? null,
+            async () => {
+              await lineClient.pushMessage(lineUserId, [buildMessage(firstStep.message_type, expandedContent)]);
+              // messages_log は非致命: ログ失敗で送信失敗扱い→再送を招かないよう握りつぶす
+              try {
+                const logId = crypto.randomUUID();
+                await db
+                  .prepare(
+                    `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, created_at)
+                     VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, ?)`,
+                  )
+                  .bind(logId, friend.id, firstStep.message_type, firstStep.message_content, firstStep.id, jstNow())
+                  .run();
+              } catch (logErr) {
+                console.error(`[friend-add] messages_log insert failed fs=${enrollment.id}:`, logErr);
+              }
+            },
+          );
         }
       }
     } catch (err) {
