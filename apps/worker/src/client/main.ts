@@ -204,10 +204,18 @@ async function linkAndAddFlow() {
     const existingUuid = getSavedUuid();
 
     // Get profile, ID token, and friendship status in parallel
+    // getFriendship() can hang if Bot Link isn't fully configured —
+    // fall back to { friendFlag: false } after 3s so the UI doesn't get stuck.
+    const friendshipWithTimeout = Promise.race([
+      liff.getFriendship().catch(() => ({ friendFlag: false })),
+      new Promise<{ friendFlag: boolean }>((resolve) =>
+        setTimeout(() => resolve({ friendFlag: false }), 3000),
+      ),
+    ]);
     const [profile, rawIdToken, friendship] = await Promise.all([
       liff.getProfile(),
       Promise.resolve(liff.getIDToken()),
-      liff.getFriendship(),
+      friendshipWithTimeout,
     ]);
 
     // 1. UUID linking (always, regardless of friendship)

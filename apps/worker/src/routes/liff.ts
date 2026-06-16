@@ -15,12 +15,98 @@ import {
   getRandomPoolAccount,
   getTrackedLinkById,
   getMessageTemplateById,
+  getUserFriends,
   jstNow,
 } from '@line-crm/db';
 import { buildIntroMessage } from '../services/intro-message.js';
 import type { Env } from '../index.js';
 
 const liffRoutes = new Hono<Env>();
+
+/**
+ * OAuth state signing — HMAC-SHA256 with timestamp + nonce.
+ * Prevents CSRF (forged state) and replay (10-min expiry).
+ *
+ * State format (base64-encoded JSON wrapper):
+ *   { d: "<JSON of {...originalFields, t: timestamp, n: nonce}>", s: "<base64url HMAC sig>" }
+ *
+ * Key derivation: HMAC(LINE_CHANNEL_SECRET + ":oauth-state-signing")
+ * — never reuse channel secret directly for HMAC.
+ */
+const STATE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+async function deriveStateSigningKey(secret: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret + ':oauth-state-signing'),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify'],
+  );
+}
+
+function b64urlEncode(bytes: Uint8Array): string {
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64urlDecode(s: string): Uint8Array {
+  const padded = s.replace(/-/g, '+').replace(/_/g, '/')
+    .padEnd(Math.ceil(s.length / 4) * 4, '=');
+  return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+}
+
+async function signState(stateObj: Record<string, unknown>, secret: string): Promise<string> {
+  const data = { ...stateObj, t: Date.now(), n: crypto.randomUUID() };
+  const dataStr = JSON.stringify(data);
+  const key = await deriveStateSigningKey(secret);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(dataStr));
+  const sigB64 = b64urlEncode(new Uint8Array(sig));
+  return btoa(JSON.stringify({ d: dataStr, s: sigB64 }));
+}
+
+async function verifyState(encodedState: string, secret: string): Promise<Record<string, unknown> | null> {
+  if (!encodedState) return null;
+  try {
+    const wrap = JSON.parse(atob(encodedState));
+    if (!wrap.d || !wrap.s || typeof wrap.d !== 'string' || typeof wrap.s !== 'string') return null;
+    const key = await deriveStateSigningKey(secret);
+    const sigBytes = b64urlDecode(wrap.s);
+    const valid = await crypto.subtle.verify('HMAC', key, sigBytes, new TextEncoder().encode(wrap.d));
+    if (!valid) return null;
+    const data = JSON.parse(wrap.d);
+    if (typeof data.t !== 'number' || Date.now() - data.t > STATE_TTL_MS) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Open Redirect protection
+ * Only allow redirects to:
+ *   - the worker's own origin
+ *   - bizsp.net (and *.bizsp.net) — primary LP host
+ *   - liff.line.me — LINE LIFF
+ *   - line.me — LINE main domain
+ * Returns false for any other origin or malformed URLs.
+ */
+function isSafeRedirect(target: string, workerUrl: string): boolean {
+  if (!target) return false;
+  // Allow relative paths (same-origin)
+  if (target.startsWith('/') && !target.startsWith('//')) return true;
+  try {
+    const url = new URL(target);
+    const workerOrigin = new URL(workerUrl).origin;
+    if (url.origin === workerOrigin) return true;
+    const host = url.hostname.toLowerCase();
+    if (host === 'bizsp.net' || host.endsWith('.bizsp.net')) return true;
+    if (host === 'liff.line.me' || host === 'line.me' || host.endsWith('.line.me')) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 // ─── LINE Login OAuth (bot_prompt=aggressive) ───────────────────
 
@@ -147,8 +233,10 @@ liffRoutes.get('/auth/line', async (c) => {
   // can verify against the correct gate via the correct X Harness instance.
   // Without these, the form falls back to the gateId baked into the form's
   // onSubmitWebhookUrl (which is stale when a form is reused across campaigns).
-  const state = JSON.stringify({ ref, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, ig: igParam });
-  const encodedState = btoa(state);
+  const encodedState = await signState(
+    { ref, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, ig: igParam },
+    c.env.LINE_CHANNEL_SECRET,
+  );
   const loginUrl = new URL('https://access.line.me/oauth2/v2.1/authorize');
   loginUrl.searchParams.set('response_type', 'code');
   loginUrl.searchParams.set('client_id', channelId);
@@ -276,15 +364,17 @@ liffRoutes.get('/auth/oauth', async (c) => {
     }
   }
 
-  // Build OAuth URL with full state
+  // Build OAuth URL with full state (HMAC-signed)
   const callbackUrl = `${baseUrl}/auth/callback`;
-  const state = JSON.stringify({
-    ref, redirect, form: formId, gate: gateParam, xh: xhParam,
-    gclid, fbclid, twclid, ttclid,
-    utmSource, utmMedium, utmCampaign,
-    account: accountParam || poolAccount, uid: uidParam, ig: igParam,
-  });
-  const encodedState = btoa(state);
+  const encodedState = await signState(
+    {
+      ref, redirect, form: formId, gate: gateParam, xh: xhParam,
+      gclid, fbclid, twclid, ttclid,
+      utmSource, utmMedium, utmCampaign,
+      account: accountParam || poolAccount, uid: uidParam, ig: igParam,
+    },
+    c.env.LINE_CHANNEL_SECRET,
+  );
   const loginUrl = new URL('https://access.line.me/oauth2/v2.1/authorize');
   loginUrl.searchParams.set('response_type', 'code');
   loginUrl.searchParams.set('client_id', channelId);
@@ -322,26 +412,27 @@ liffRoutes.get('/auth/callback', async (c) => {
   let accountParam = '';
   let uidParam = '';
   let igParam = '';
-  try {
-    const parsed = JSON.parse(atob(stateParam));
-    ref = parsed.ref || '';
-    redirect = parsed.redirect || '';
-    formId = parsed.form || '';
-    gateParam = parsed.gate || '';
-    xhParam = parsed.xh || '';
-    gclid = parsed.gclid || '';
-    fbclid = parsed.fbclid || '';
-    twclid = parsed.twclid || '';
-    ttclid = parsed.ttclid || '';
-    utmSource = parsed.utmSource || '';
-    utmMedium = parsed.utmMedium || '';
-    utmCampaign = parsed.utmCampaign || '';
-    accountParam = parsed.account || '';
-    uidParam = parsed.uid || '';
-    igParam = parsed.ig || '';
-  } catch {
-    // ignore
+  // Verify HMAC-signed state (CSRF + replay protection, 10-min TTL)
+  const parsed = await verifyState(stateParam, c.env.LINE_CHANNEL_SECRET);
+  if (!parsed) {
+    console.error('[security] OAuth callback: invalid or expired state');
+    return c.html(errorPage('認証リクエストが無効または期限切れです。もう一度最初からお試しください。'));
   }
+  ref = (parsed.ref as string) || '';
+  redirect = (parsed.redirect as string) || '';
+  formId = (parsed.form as string) || '';
+  gateParam = (parsed.gate as string) || '';
+  xhParam = (parsed.xh as string) || '';
+  gclid = (parsed.gclid as string) || '';
+  fbclid = (parsed.fbclid as string) || '';
+  twclid = (parsed.twclid as string) || '';
+  ttclid = (parsed.ttclid as string) || '';
+  utmSource = (parsed.utmSource as string) || '';
+  utmMedium = (parsed.utmMedium as string) || '';
+  utmCampaign = (parsed.utmCampaign as string) || '';
+  accountParam = (parsed.account as string) || '';
+  uidParam = (parsed.uid as string) || '';
+  igParam = (parsed.ig as string) || '';
 
   if (error || !code) {
     return c.html(errorPage(error || 'Authorization failed'));
@@ -436,6 +527,41 @@ liffRoutes.get('/auth/callback', async (c) => {
       statusMessage: null,
     });
 
+    // Resolve line_account_id for THIS registration session.
+    // IMPORTANT: In same-Provider multi-account setups, LINE Login `sub` is shared
+    // across Login channels, so one LINE user → one friend record. The friend's
+    // line_account_id gets set on first registration and then becomes stale when
+    // the same user registers via a different bot. So we let accountParam OVERRIDE
+    // the existing line_account_id to reflect the current session.
+    // Priority: accountParam (explicit) > login_channel_id一致 > existing > 単一active.
+    let resolvedAccountId: string | null = null;
+    if (accountParam) {
+      const acct = await getLineAccountByChannelId(db, accountParam);
+      if (acct?.id) resolvedAccountId = acct.id;
+    }
+    if (!resolvedAccountId) {
+      const byLogin = await db
+        .prepare('SELECT id FROM line_accounts WHERE login_channel_id = ? AND is_active = 1 LIMIT 1')
+        .bind(loginChannelId)
+        .first<{ id: string }>();
+      if (byLogin?.id) resolvedAccountId = byLogin.id;
+    }
+    if (!resolvedAccountId) {
+      resolvedAccountId = (friend as unknown as Record<string, string | null>).line_account_id ?? null;
+    }
+    if (!resolvedAccountId) {
+      const singleton = await db
+        .prepare('SELECT id FROM line_accounts WHERE is_active = 1 LIMIT 2')
+        .all<{ id: string }>();
+      if (singleton.results.length === 1) resolvedAccountId = singleton.results[0].id;
+    }
+    if (resolvedAccountId && resolvedAccountId !== (friend as unknown as Record<string, string | null>).line_account_id) {
+      await db
+        .prepare('UPDATE friends SET line_account_id = ?, updated_at = ? WHERE id = ?')
+        .bind(resolvedAccountId, jstNow(), friend.id)
+        .run();
+    }
+
     // IG cross-platform UUID linkage
     // If the tracked link carried ?ig=<IGSID>, persist it on our side and
     // notify IG Harness so both DBs hold a bidirectional reference.
@@ -475,9 +601,24 @@ liffRoutes.get('/auth/callback', async (c) => {
     if (existingUserId) {
       userId = existingUserId;
     } else {
-      // Cross-account linking: if uid is provided, use that existing UUID
+      // Cross-account linking: if uid is provided, verify ownership before linking.
+      // IDOR protection: same-Provider users share LINE `sub`, so we require
+      // that at least one existing friend linked to this user has the matching
+      // line_user_id. This blocks attackers from linking their account to
+      // another user's UUID.
       if (uidParam) {
-        userId = uidParam;
+        try {
+          const existingFriends = await getUserFriends(db, uidParam);
+          const isOwner = existingFriends.some((f) => f.line_user_id === lineUserId);
+          if (isOwner) {
+            userId = uidParam;
+          } else {
+            console.error(`[security] Rejected uid linkage: uid=${uidParam.slice(0, 8)}... sub=${lineUserId.slice(0, 8)}...`);
+            // Silently fall through (don't leak UUID existence)
+          }
+        } catch (err) {
+          console.error('uid ownership check failed:', err);
+        }
       }
 
       // Try to find by email
@@ -533,8 +674,76 @@ liffRoutes.get('/auth/callback', async (c) => {
         if (route.tag_id) {
           await addTagToFriend(db, friend.id, route.tag_id);
         }
-        // Auto-enroll in scenario (scenario_id stored; enrollment handled by scenario engine)
-        // Future: call enrollFriendInScenario(db, friend.id, route.scenario_id) here
+        // Option C: most-recent-LP wins.
+        // - Pause all other active scenarios (so multi-day step delivery doesn't double-fire
+        //   when the same friend registers via a 2nd LP).
+        // - Enroll in this entry_route's scenario (or re-activate if previously paused).
+        // - Immediate deliver step 1 only on FRESH enrollment (skip if re-activating
+        //   to avoid sending the gift twice).
+        if (route.scenario_id) {
+          try {
+            // 1) Pause all other active scenarios for this friend.
+            await db
+              .prepare("UPDATE friend_scenarios SET status = 'paused', updated_at = ? WHERE friend_id = ? AND scenario_id != ? AND status = 'active'")
+              .bind(jstNow(), friend.id, route.scenario_id)
+              .run();
+
+            // 2) Look up any existing non-completed enrollment for this scenario.
+            const existing = await db
+              .prepare("SELECT id, status FROM friend_scenarios WHERE friend_id = ? AND scenario_id = ? AND status != 'completed' ORDER BY started_at DESC LIMIT 1")
+              .bind(friend.id, route.scenario_id)
+              .first<{ id: string; status: string }>();
+
+            if (existing) {
+              // Re-activate paused enrollment without re-sending step 1.
+              if (existing.status === 'paused') {
+                await db
+                  .prepare("UPDATE friend_scenarios SET status = 'active', updated_at = ? WHERE id = ?")
+                  .bind(jstNow(), existing.id)
+                  .run();
+              }
+              // active: no-op (already running for this scenario).
+            } else {
+              // 3) Fresh enrollment + immediate delivery of step 1.
+              const { enrollFriendInScenario: enrollEntry, getScenarioSteps: getStepsEntry } = await import('@line-crm/db');
+              const { LineClient: LineClientEntry } = await import('@line-crm/line-sdk');
+              const { buildMessage: buildMsgEntry, expandVariables: expandVarsEntry, resolveMetadata: resolveMetaEntry } = await import('../services/step-delivery.js');
+              const enrollment = await enrollEntry(db, friend.id, route.scenario_id);
+              if (enrollment) {
+                const steps = await getStepsEntry(db, route.scenario_id);
+                const firstStep = steps[0];
+                if (firstStep && firstStep.delay_minutes === 0) {
+                  let entryAccessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
+                  const byLogin = await db
+                    .prepare('SELECT channel_access_token FROM line_accounts WHERE login_channel_id = ? AND is_active = 1 LIMIT 1')
+                    .bind(loginChannelId)
+                    .first<{ channel_access_token: string }>();
+                  if (byLogin?.channel_access_token) entryAccessToken = byLogin.channel_access_token;
+                  const entryLineClient = new LineClientEntry(entryAccessToken);
+                  const meta = await resolveMetaEntry(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
+                  const expanded = expandVarsEntry(
+                    firstStep.message_content,
+                    { ...friend, metadata: meta } as Parameters<typeof expandVarsEntry>[1],
+                    c.env.WORKER_URL,
+                  );
+                  await entryLineClient.pushMessage(lineUserId, [buildMsgEntry(firstStep.message_type, expanded)]);
+                }
+              }
+            }
+          } catch (err) {
+            // Structured logging for operational visibility.
+            // Cron retry will pick up failed step1 deliveries automatically
+            // (next_delivery_at is set on enrollment regardless of immediate-push outcome).
+            console.error(JSON.stringify({
+              level: 'error',
+              event: 'entry_route_enrollment_failed',
+              friendId: friend?.id,
+              ref,
+              scenarioId: route?.scenario_id,
+              error: err instanceof Error ? err.message : String(err),
+            }));
+          }
+        }
       }
     }
 
@@ -593,14 +802,17 @@ liffRoutes.get('/auth/callback', async (c) => {
       const { LineClient } = await import('@line-crm/line-sdk');
       const { buildMessage, expandVariables } = await import('../services/step-delivery.js');
 
-      // Resolve which account this friend belongs to
-      const matchedAccountId = accountParam
-        ? (await getLineAccountByChannelId(db, accountParam))?.id ?? null
-        : null;
+      // Resolve which account this friend belongs to.
+      // Prefer resolvedAccountId (set by auto-assign above); fallback to accountParam lookup.
+      const matchedAccountId = resolvedAccountId
+        ?? (accountParam ? (await getLineAccountByChannelId(db, accountParam))?.id ?? null : null);
 
-      // Get access token for this account
+      // Get access token for this account (matched > accountParam > env default)
       let accessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
-      if (accountParam) {
+      if (matchedAccountId) {
+        const acct = await getLineAccountById(db, matchedAccountId);
+        if (acct?.channel_access_token) accessToken = acct.channel_access_token;
+      } else if (accountParam) {
         const acct = await getLineAccountByChannelId(db, accountParam);
         if (acct) accessToken = acct.channel_access_token;
       }
@@ -609,23 +821,37 @@ liffRoutes.get('/auth/callback', async (c) => {
       const scenarios = await getScenarios(db);
       for (const scenario of scenarios) {
         const scenarioAccountMatch = !scenario.line_account_id || !matchedAccountId || scenario.line_account_id === matchedAccountId;
-        if (scenario.trigger_type === 'friend_add' && scenario.is_active && scenarioAccountMatch) {
-          const enrollment = await enroll(db, friend.id, scenario.id);
-          if (enrollment) {
-            // Immediate delivery of first step (skip delivery window)
-            const steps = await getScenarioSteps(db, scenario.id);
-            const firstStep = steps[0];
-            if (firstStep && firstStep.delay_minutes === 0) {
-              const { resolveMetadata: resolveMetaLiff } = await import('../services/step-delivery.js');
-              const resolvedMetaLiff = await resolveMetaLiff(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
-              const expandedContent = expandVariables(
-                firstStep.message_content,
-                { ...friend, metadata: resolvedMetaLiff } as Parameters<typeof expandVariables>[1],
-                c.env.WORKER_URL,
-              );
-              await lineClient.pushMessage(lineUserId, [buildMessage(firstStep.message_type, expandedContent)]);
-            }
-          }
+        if (scenario.trigger_type !== 'friend_add' || !scenario.is_active || !scenarioAccountMatch) continue;
+
+        // Check condition BEFORE enrollment. If condition fails, skip
+        // enrollment entirely so subsequent ref-based registrations can still
+        // enroll this user (no stale 'active' row blocking re-enroll).
+        const steps = await getScenarioSteps(db, scenario.id);
+        const firstStep = steps[0];
+        if (firstStep?.condition_type === 'tag_exists' && firstStep.condition_value) {
+          const hit = await db
+            .prepare('SELECT 1 FROM friend_tags WHERE friend_id = ? AND tag_id = ? LIMIT 1')
+            .bind(friend.id, firstStep.condition_value)
+            .first();
+          if (!hit) continue;
+        } else if (firstStep?.condition_type === 'tag_not_exists' && firstStep.condition_value) {
+          const hit = await db
+            .prepare('SELECT 1 FROM friend_tags WHERE friend_id = ? AND tag_id = ? LIMIT 1')
+            .bind(friend.id, firstStep.condition_value)
+            .first();
+          if (hit) continue;
+        }
+
+        const enrollment = await enroll(db, friend.id, scenario.id);
+        if (enrollment && firstStep && firstStep.delay_minutes === 0) {
+          const { resolveMetadata: resolveMetaLiff } = await import('../services/step-delivery.js');
+          const resolvedMetaLiff = await resolveMetaLiff(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
+          const expandedContent = expandVariables(
+            firstStep.message_content,
+            { ...friend, metadata: resolvedMetaLiff } as Parameters<typeof expandVariables>[1],
+            c.env.WORKER_URL,
+          );
+          await lineClient.pushMessage(lineUserId, [buildMessage(firstStep.message_type, expandedContent)]);
         }
       }
     } catch (err) {
@@ -633,7 +859,8 @@ liffRoutes.get('/auth/callback', async (c) => {
     }
 
     // Redirect or show completion
-    if (redirect) {
+    // Security: only allow redirect to allowlisted origins (Open Redirect protection)
+    if (redirect && isSafeRedirect(redirect, c.env.WORKER_URL)) {
       return c.redirect(redirect);
     }
 
@@ -791,12 +1018,47 @@ liffRoutes.get('/api/liff/config', async (c) => {
 
 // ─── Existing LIFF endpoints ────────────────────────────────────
 
-// POST /api/liff/profile - get friend by LINE userId (public, no auth)
+// POST /api/liff/profile - get friend by LINE userId
+// Security: requires LINE idToken to verify caller is the actual user
 liffRoutes.post('/api/liff/profile', async (c) => {
   try {
-    const body = await c.req.json<{ lineUserId: string }>();
+    const body = await c.req.json<{ lineUserId: string; idToken?: string }>();
     if (!body.lineUserId) {
       return c.json({ success: false, error: 'lineUserId is required' }, 400);
+    }
+    if (!body.idToken) {
+      return c.json({ success: false, error: 'idToken required' }, 401);
+    }
+
+    // Verify idToken via LINE API across all configured Login channels
+    const loginChannelIds = [c.env.LINE_LOGIN_CHANNEL_ID];
+    const dbAccounts = await getLineAccounts(c.env.DB);
+    for (const acct of dbAccounts) {
+      if (acct.login_channel_id && !loginChannelIds.includes(acct.login_channel_id)) {
+        loginChannelIds.push(acct.login_channel_id);
+      }
+    }
+
+    let verified: { sub: string } | null = null;
+    for (const channelId of loginChannelIds) {
+      const verifyRes = await fetch('https://api.line.me/oauth2/v2.1/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ id_token: body.idToken, client_id: channelId }),
+      });
+      if (verifyRes.ok) {
+        verified = await verifyRes.json<{ sub: string }>();
+        break;
+      }
+    }
+
+    if (!verified) {
+      return c.json({ success: false, error: 'Invalid idToken' }, 401);
+    }
+
+    // Confirm token's subject matches the requested lineUserId
+    if (verified.sub !== body.lineUserId) {
+      return c.json({ success: false, error: 'idToken does not match lineUserId' }, 403);
     }
 
     const friend = await getFriendByLineUserId(c.env.DB, body.lineUserId);

@@ -4,6 +4,8 @@ export interface Tag {
   name: string;
   color: string;
   created_at: string;
+  /** Tenant scope. NULL = global (visible to all bots, backward-compat). */
+  line_account_id: string | null;
 }
 
 export interface FriendTag {
@@ -12,7 +14,21 @@ export interface FriendTag {
   assigned_at: string;
 }
 
-export async function getTags(db: D1Database): Promise<Tag[]> {
+/**
+ * List tags, optionally scoped to a specific LINE account.
+ * Tags with NULL line_account_id are global (always included for backward compat).
+ */
+export async function getTags(
+  db: D1Database,
+  lineAccountId?: string | null,
+): Promise<Tag[]> {
+  if (lineAccountId) {
+    const result = await db
+      .prepare(`SELECT * FROM tags WHERE line_account_id = ? OR line_account_id IS NULL ORDER BY name ASC`)
+      .bind(lineAccountId)
+      .all<Tag>();
+    return result.results;
+  }
   const result = await db
     .prepare(`SELECT * FROM tags ORDER BY name ASC`)
     .all<Tag>();
@@ -22,6 +38,8 @@ export async function getTags(db: D1Database): Promise<Tag[]> {
 export interface CreateTagInput {
   name: string;
   color?: string;
+  /** Optional tenant scope. NULL = global tag. */
+  lineAccountId?: string | null;
 }
 
 export async function createTag(
@@ -34,10 +52,10 @@ export async function createTag(
 
   await db
     .prepare(
-      `INSERT INTO tags (id, name, color, created_at)
-       VALUES (?, ?, ?, ?)`,
+      `INSERT INTO tags (id, name, color, created_at, line_account_id)
+       VALUES (?, ?, ?, ?, ?)`,
     )
-    .bind(id, input.name, color, now)
+    .bind(id, input.name, color, now, input.lineAccountId ?? null)
     .run();
 
   return (await db

@@ -365,21 +365,24 @@ export async function getFriendScenariosDueForDelivery(
   db: D1Database,
   now: string,
 ): Promise<FriendScenario[]> {
-  // Fetch all active scenarios with a delivery time, then filter by epoch comparison
-  // to handle mixed timestamp formats (Z and +09:00) during migration
+  // Filter due scenarios at SQL level (massively reduces D1 reads at scale).
+  // strftime('%s', ...) normalizes mixed timestamp formats (Z and +09:00)
+  // by converting both sides to Unix epoch.
+  // The JS comparison below acts as a safety net for any edge cases.
   const result = await db
     .prepare(
       `SELECT fs.* FROM friend_scenarios fs
        INNER JOIN scenarios s ON fs.scenario_id = s.id
        WHERE fs.status = 'active'
          AND s.is_active = 1
-         AND fs.next_delivery_at IS NOT NULL`,
+         AND fs.next_delivery_at IS NOT NULL
+         AND CAST(strftime('%s', fs.next_delivery_at) AS INTEGER) <= CAST(strftime('%s', ?) AS INTEGER)
+       ORDER BY fs.next_delivery_at ASC`,
     )
+    .bind(now)
     .all<FriendScenario>();
   const nowMs = new Date(now).getTime();
-  return result.results
-    .filter((fs) => new Date(fs.next_delivery_at!).getTime() <= nowMs)
-    .sort((a, b) => new Date(a.next_delivery_at!).getTime() - new Date(b.next_delivery_at!).getTime());
+  return result.results.filter((fs) => new Date(fs.next_delivery_at!).getTime() <= nowMs);
 }
 
 /**

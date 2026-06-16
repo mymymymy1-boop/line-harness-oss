@@ -109,13 +109,18 @@ function enforceDeliveryWindow(date: Date, preferredHour?: number): Date {
   return result;
 }
 
-const MAX_SENDS_PER_CRON = 40; // CF Free plan: 50 subrequests limit (margin for other jobs)
+// Configurable via env: set MAX_SENDS_PER_CRON in wrangler.toml or as secret.
+// CF Free plan: 50 subrequests/invocation → keep ≤40 (margin for other jobs).
+// CF Workers Paid: 1000+ subrequests → safe to raise to 150-300 for higher throughput.
+const DEFAULT_MAX_SENDS_PER_CRON = 40;
 
 export async function processStepDeliveries(
   db: D1Database,
   lineClient: LineClient,
   workerUrl?: string,
+  maxSendsPerCron?: number,
 ): Promise<void> {
+  const MAX_SENDS_PER_CRON = maxSendsPerCron ?? DEFAULT_MAX_SENDS_PER_CRON;
   // Skip delivery outside 9:00-23:00 JST window
   const jstHour = new Date(Date.now() + 9 * 60 * 60_000).getUTCHours();
   if (jstHour < DEFAULT_START_HOUR || jstHour >= DEFAULT_END_HOUR) return;
@@ -238,17 +243,39 @@ async function processSingleDelivery(
       deliveryClient = new LC(account.channel_access_token);
     }
   }
-  await deliveryClient.pushMessage(friend.line_user_id, [message]);
+  // Send push message with error recovery (Finding #1: prevent 'delivering' freeze)
+  // pushMessage が例外を投げた場合、status='delivering' のまま凍結する窓を閉じる
+  try {
+    await deliveryClient.pushMessage(friend.line_user_id, [message]);
+  } catch (err) {
+    console.error(`[step-delivery] pushMessage failed fs=${fs.id} friend=${fs.friend_id}:`, err);
+    // Release 'delivering' → 'active' for retry 5 分後
+    // current_step_order を据え置きすることで「同じstep」を次cronで再試行
+    const retryDate = new Date(Date.now() + 9 * 60 * 60_000 + 5 * 60 * 1000);
+    const windowedRetry = enforceDeliveryWindow(retryDate, preferredHour);
+    await advanceFriendScenario(
+      db,
+      fs.id,
+      fs.current_step_order,
+      windowedRetry.toISOString().slice(0, -1) + '+09:00',
+    );
+    return false;
+  }
 
-  // Log outgoing message
-  const logId = crypto.randomUUID();
-  await db
-    .prepare(
-      `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, created_at)
-       VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, ?)`,
-    )
-    .bind(logId, friend.id, currentStep.message_type, currentStep.message_content, currentStep.id, jstNow())
-    .run();
+  // Log outgoing message (非致命: ログ失敗してもadvanceは進める)
+  try {
+    const logId = crypto.randomUUID();
+    await db
+      .prepare(
+        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, created_at)
+         VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, ?)`,
+      )
+      .bind(logId, friend.id, currentStep.message_type, currentStep.message_content, currentStep.id, jstNow())
+      .run();
+  } catch (err) {
+    console.error(`[step-delivery] messages_log insert failed fs=${fs.id}:`, err);
+    // continue — pushは成功したのでadvance優先
+  }
 
   // Determine next step (find the step after currentStep in the sorted list)
   const currentIndex = steps.indexOf(currentStep);

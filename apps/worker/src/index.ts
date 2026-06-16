@@ -61,6 +61,11 @@ export type Env = {
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
     IG_HARNESS_URL?: string;  // Optional: IG Harness API URL for cross-platform linking
     IG_HARNESS_LINK_SECRET?: string;  // Shared secret for IG Harness link-line webhook
+    MAX_SENDS_PER_CRON?: string;  // Optional: override step delivery throughput per cron tick (CF Free=40, Paid=150-300)
+    STRIPE_SECRET_KEY?: string;
+    STRIPE_PUBLISHABLE_KEY?: string;
+    STRIPE_WEBHOOK_SECRET?: string;
+    VIMEO_SHOWCASE_PASSWORD?: string;  // 購入レシート配信時の視聴ページパスワード
   };
   Variables: {
     staff: { id: string; name: string; role: 'owner' | 'admin' | 'staff' };
@@ -346,8 +351,9 @@ async function scheduled(
   // 以前はアカウントごとにループしていたが、アカウントフィルタなしのDBクエリで
   // 全アカウントの配信が各ループで重複実行されていたバグを修正
   const jobs = [];
+  const maxSendsPerCron = env.MAX_SENDS_PER_CRON ? Number(env.MAX_SENDS_PER_CRON) : undefined;
   jobs.push(
-    processStepDeliveries(env.DB, defaultLineClient, env.WORKER_URL),
+    processStepDeliveries(env.DB, defaultLineClient, env.WORKER_URL, maxSendsPerCron),
     processScheduledBroadcasts(env.DB, defaultLineClient, env.WORKER_URL),
     processReminderDeliveries(env.DB, defaultLineClient),
   );
