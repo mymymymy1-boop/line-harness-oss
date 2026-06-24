@@ -593,6 +593,23 @@ liffRoutes.get('/auth/callback', async (c) => {
       }
     }
 
+    // Kindle Factory への登録通知 (本ごとのLINE登録を計測).
+    // ref が Kindle の本コード(8桁hex)のときだけ、登録完了を Kindle の webhook に best-effort 通知。
+    // Origin: https://bizsp.net で認証(Kindle側の許可Originに登録済)。env未設定なら何もしない。
+    if (c.env.KINDLE_TRACK_URL && ref && /^[0-9a-f]{8}$/.test(ref)) {
+      c.executionCtx.waitUntil(
+        fetch(c.env.KINDLE_TRACK_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Origin': 'https://bizsp.net' },
+          body: JSON.stringify({ ref, channel: 'line', external_id: lineUserId }),
+        }).then(async (res) => {
+          if (!res.ok) {
+            console.error('Kindle track notify failed:', res.status, await res.text().catch(() => ''));
+          }
+        }).catch((err) => console.error('Kindle track notify error:', err))
+      );
+    }
+
     // Create or find user → link
     let userId: string | null = null;
 

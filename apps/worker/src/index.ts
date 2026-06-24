@@ -61,6 +61,7 @@ export type Env = {
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
     IG_HARNESS_URL?: string;  // Optional: IG Harness API URL for cross-platform linking
     IG_HARNESS_LINK_SECRET?: string;  // Shared secret for IG Harness link-line webhook
+    KINDLE_TRACK_URL?: string;  // Optional: Kindle Factory の登録計測 webhook (本ごとのLINE登録帰属)
     MAX_SENDS_PER_CRON?: string;  // Optional: override step delivery throughput per cron tick (CF Free=40, Paid=150-300)
     STRIPE_SECRET_KEY?: string;
     STRIPE_PUBLISHABLE_KEY?: string;

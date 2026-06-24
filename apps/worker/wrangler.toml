@@ -3,11 +3,11 @@ main = "src/index.ts"
 compatibility_date = "2024-12-01"
 workers_dev = true
 
-# ═══════════════════════════════════════════════════════════════
-# デフォルト = テスト環境 (noda@)
-# 使い方: npx wrangler deploy
-# ═══════════════════════════════════════════════════════════════
-account_id = "YOUR_DEV_ACCOUNT_ID"
+account_id = "bf4d6f5cd8caf5fbb0a20c6841c5de38"
+
+[vars]
+# Kindle Factory の登録計測 webhook。本ごとのLINE登録を Kindle 側 /analytics に集計する。
+KINDLE_TRACK_URL = "https://kindle.bizsp.net/track/register"
 
 [assets]
 directory = "dist/client"
@@ -16,35 +16,11 @@ binding = "ASSETS"
 [[d1_databases]]
 binding = "DB"
 database_name = "line-harness"
-database_id = "YOUR_DEV_D1_DATABASE_ID"
+database_id = "f9fa851c-c58b-44d8-8b6c-c2fce18caa15"
 
 [[r2_buckets]]
 binding = "IMAGES"
 bucket_name = "line-harness-images"
 
 [triggers]
-crons = ["*/5 * * * *"]
-
-# ═══════════════════════════════════════════════════════════════
-# 本番環境 (aiagent.mini@)
-# 使い方: npx wrangler deploy --env production --name your-worker-name
-# D1:     npx wrangler d1 execute line-crm --env production --remote --file ...
-# ═══════════════════════════════════════════════════════════════
-[env.production]
-account_id = "YOUR_ACCOUNT_ID"
-
-[env.production.assets]
-directory = "dist/client"
-binding = "ASSETS"
-
-[[env.production.d1_databases]]
-binding = "DB"
-database_name = "line-crm"
-database_id = "YOUR_D1_DATABASE_ID"
-
-[[env.production.r2_buckets]]
-binding = "IMAGES"
-bucket_name = "line-harness-images"
-
-[env.production.triggers]
 crons = ["*/5 * * * *"]
