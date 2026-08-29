@@ -123,6 +123,9 @@ function isSafeRedirect(target: string, workerUrl: string): boolean {
  */
 liffRoutes.get('/auth/line', async (c) => {
   const ref = c.req.query('ref') || '';
+  // b: Kindle Factory の本コード(8桁hex)。ref はキャンペーン(speech/publishing)に使われ
+  // entry_routes → タグ → シナリオを決めるので上書きできない。どの本から来たかは別枠で運ぶ。
+  const bookParam = c.req.query('b') || '';
   const redirect = c.req.query('redirect') || '';
   const formId = c.req.query('form') || '';
   const gclid = c.req.query('gclid') || '';
@@ -209,6 +212,7 @@ liffRoutes.get('/auth/line', async (c) => {
   const liffParams = new URLSearchParams();
   if (liffIdMatch) liffParams.set('liffId', liffIdMatch[1]);
   if (externalRef) liffParams.set('ref', externalRef);
+  if (bookParam) liffParams.set('b', bookParam);
   if (formId) liffParams.set('form', formId);
   const gateParam = c.req.query('gate') || '';
   if (gateParam) liffParams.set('gate', gateParam);
@@ -234,7 +238,7 @@ liffRoutes.get('/auth/line', async (c) => {
   // Without these, the form falls back to the gateId baked into the form's
   // onSubmitWebhookUrl (which is stale when a form is reused across campaigns).
   const encodedState = await signState(
-    { ref, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, ig: igParam },
+    { ref, b: bookParam, redirect, form: formId, gate: gateParam, xh: xhParam2, gclid, fbclid, twclid, ttclid, utmSource, utmMedium, utmCampaign, account: accountParam || poolAccount, uid: uidParam, ig: igParam },
     c.env.LINE_CHANNEL_SECRET,
   );
   const loginUrl = new URL('https://access.line.me/oauth2/v2.1/authorize');
@@ -321,6 +325,7 @@ liffRoutes.get('/auth/line', async (c) => {
  */
 liffRoutes.get('/auth/oauth', async (c) => {
   const ref = c.req.query('ref') || '';
+  const bookParam = c.req.query('b') || '';   // Kindle Factory の本コード(8桁hex)
   const redirect = c.req.query('redirect') || '';
   const formId = c.req.query('form') || '';
   const gateParam = c.req.query('gate') || '';
@@ -368,7 +373,7 @@ liffRoutes.get('/auth/oauth', async (c) => {
   const callbackUrl = `${baseUrl}/auth/callback`;
   const encodedState = await signState(
     {
-      ref, redirect, form: formId, gate: gateParam, xh: xhParam,
+      ref, b: bookParam, redirect, form: formId, gate: gateParam, xh: xhParam,
       gclid, fbclid, twclid, ttclid,
       utmSource, utmMedium, utmCampaign,
       account: accountParam || poolAccount, uid: uidParam, ig: igParam,
@@ -398,6 +403,7 @@ liffRoutes.get('/auth/callback', async (c) => {
 
   // Parse state (contains ref, redirect, and ad click IDs)
   let ref = '';
+  let bookCode = '';   // Kindle Factory の本コード(8桁hex)
   let redirect = '';
   let formId = '';
   let gateParam = '';
@@ -419,6 +425,7 @@ liffRoutes.get('/auth/callback', async (c) => {
     return c.html(errorPage('認証リクエストが無効または期限切れです。もう一度最初からお試しください。'));
   }
   ref = (parsed.ref as string) || '';
+  bookCode = (parsed.b as string) || '';
   redirect = (parsed.redirect as string) || '';
   formId = (parsed.form as string) || '';
   gateParam = (parsed.gate as string) || '';
@@ -596,12 +603,16 @@ liffRoutes.get('/auth/callback', async (c) => {
     // Kindle Factory への登録通知 (本ごとのLINE登録を計測).
     // ref が Kindle の本コード(8桁hex)のときだけ、登録完了を Kindle の webhook に best-effort 通知。
     // Origin: https://bizsp.net で認証(Kindle側の許可Originに登録済)。env未設定なら何もしない。
-    if (c.env.KINDLE_TRACK_URL && ref && /^[0-9a-f]{8}$/.test(ref)) {
+    // 2026-08-29: LP は ref にキャンペーン名(speech/publishing)を使うため、本コードは
+    // b パラメータで運ぶ。b が無い旧リンクのため、ref 自体が本コードの場合も従来どおり通知する。
+    const kindleRef = /^[0-9a-f]{8}$/.test(bookCode) ? bookCode
+      : (/^[0-9a-f]{8}$/.test(ref) ? ref : '');
+    if (c.env.KINDLE_TRACK_URL && kindleRef) {
       c.executionCtx.waitUntil(
         fetch(c.env.KINDLE_TRACK_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Origin': 'https://bizsp.net' },
-          body: JSON.stringify({ ref, channel: 'line', external_id: lineUserId }),
+          body: JSON.stringify({ ref: kindleRef, channel: 'line', external_id: lineUserId }),
         }).then(async (res) => {
           if (!res.ok) {
             console.error('Kindle track notify failed:', res.status, await res.text().catch(() => ''));
@@ -1151,6 +1162,7 @@ liffRoutes.post('/api/liff/link', async (c) => {
       idToken: string;
       displayName?: string | null;
       ref?: string;
+      b?: string;           // Kindle Factory の本コード(8桁hex)
       existingUuid?: string;
     }>();
 
@@ -1243,6 +1255,27 @@ liffRoutes.post('/api/liff/link', async (c) => {
     }
 
     await linkFriendToUser(db, friend.id, userId);
+
+    // Kindle Factory への登録通知 (LIFF経路). OAuthコールバックと同じ作法。
+    // スマホは LINE アプリ内 LIFF を通るため、この経路を入れないと本ごとの帰属が
+    // デスクトップぶんしか溜まらない (2026-08-29)。
+    {
+      const kindleRef = /^[0-9a-f]{8}$/.test(body.b || '') ? (body.b as string)
+        : (/^[0-9a-f]{8}$/.test(body.ref || '') ? (body.ref as string) : '');
+      if (c.env.KINDLE_TRACK_URL && kindleRef) {
+        c.executionCtx.waitUntil(
+          fetch(c.env.KINDLE_TRACK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Origin': 'https://bizsp.net' },
+            body: JSON.stringify({ ref: kindleRef, channel: 'line', external_id: lineUserId }),
+          }).then(async (res) => {
+            if (!res.ok) {
+              console.error('Kindle track notify failed (liff):', res.status, await res.text().catch(() => ''));
+            }
+          }).catch((err) => console.error('Kindle track notify error (liff):', err))
+        );
+      }
+    }
 
     // Save ref_code from LIFF (first touch wins)
     // xh: refs are X Harness one-time tokens — never persist as ref_code
