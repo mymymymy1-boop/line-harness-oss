@@ -6,6 +6,16 @@ export async function authMiddleware(c: Context<Env>, next: Next): Promise<Respo
   // Skip auth for the LINE webhook endpoint — it uses signature verification instead
   // Skip auth for OpenAPI docs — public documentation
   const path = new URL(c.req.url).pathname;
+  const method = c.req.method;
+
+  // GET-only public route: the LIFF form definition is readable without auth,
+  // but the SAME path also serves PUT (update) and DELETE. Those MUST stay
+  // authenticated — matching on path alone would let anyone rewrite a form's
+  // on_submit_webhook_url (exfiltrating every future submission) or delete it.
+  if (method === 'GET' && path.match(/^\/api\/forms\/[^/]+$/)) {
+    return next();
+  }
+
   if (
     path === '/webhook' ||
     path === '/docs' ||
@@ -25,7 +35,6 @@ export async function authMiddleware(c: Context<Env>, next: Next): Promise<Respo
     path.match(/^\/api\/forms\/[^/]+\/submit$/) ||
     path.match(/^\/api\/forms\/[^/]+\/opened$/) ||
     path.match(/^\/api\/forms\/[^/]+\/partial$/) ||
-    path.match(/^\/api\/forms\/[^/]+$/) || // GET form definition (public for LIFF)
     path === '/api/meet-callback' || // Meet Harness completion callback
     path === '/api/qr' // Public QR proxy — used by desktop landing pages
   ) {

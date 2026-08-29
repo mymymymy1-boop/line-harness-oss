@@ -14,6 +14,7 @@ dist/
 .dev.vars
 _secrets_tmp.json
 .line-harness-setup.json
+.lh_key
 apps/web/out/
 apps/worker/dist/
 .worktrees/

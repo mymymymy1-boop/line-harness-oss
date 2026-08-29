@@ -93,7 +93,11 @@ export function buildSegmentQuery(condition: SegmentCondition): { sql: string; b
 
   const separator = condition.operator === 'AND' ? ' AND ' : ' OR '
   const where = clauses.length > 0 ? clauses.join(separator) : '1=1'
-  const sql = `SELECT f.id, f.line_user_id FROM friends f WHERE ${where}`
+  // Wrap in parentheses so callers that splice in an account filter
+  // (`WHERE f.line_account_id = ? AND ...`) keep OR-groups intact. Without
+  // this, `acct AND a OR b` parses as `(acct AND a) OR b`, leaking friends of
+  // OTHER accounts that match `b`. See broadcast.ts / segment-send.ts.
+  const sql = `SELECT f.id, f.line_user_id FROM friends f WHERE (${where})`
 
   return { sql, bindings }
 }

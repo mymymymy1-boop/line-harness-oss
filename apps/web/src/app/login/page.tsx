@@ -1,5 +1,5 @@
 'use client'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 
 export default function LoginPage() {
@@ -8,8 +8,7 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false)
   const router = useRouter()
 
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault()
+  const loginWithKey = async (key: string) => {
     setLoading(true)
     setError('')
 
@@ -17,15 +16,15 @@ export default function LoginPage() {
       // Validate by calling a simple endpoint
       const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8787'
       const res = await fetch(`${apiUrl}/api/friends/count`, {
-        headers: { Authorization: `Bearer ${apiKey}` },
+        headers: { Authorization: `Bearer ${key}` },
       })
 
       if (res.ok) {
-        localStorage.setItem('lh_api_key', apiKey)
+        localStorage.setItem('lh_api_key', key)
         // Fetch staff profile for name/role display
         try {
           const profileRes = await fetch(`${apiUrl}/api/staff/me`, {
-            headers: { Authorization: `Bearer ${apiKey}` },
+            headers: { Authorization: `Bearer ${key}` },
           })
           if (profileRes.ok) {
             const profileData = await profileRes.json()
@@ -46,6 +45,24 @@ export default function LoginPage() {
     } finally {
       setLoading(false)
     }
+  }
+
+  // Magic link: /login#key=<API_KEY> — the hash never leaves the browser
+  // (not sent to the server or access logs). Strip it from the URL bar
+  // before validating so it doesn't linger in history.
+  useEffect(() => {
+    const match = window.location.hash.match(/^#key=(.+)$/)
+    if (!match) return
+    const key = decodeURIComponent(match[1])
+    history.replaceState(null, '', window.location.pathname)
+    setApiKey(key)
+    loginWithKey(key)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault()
+    loginWithKey(apiKey)
   }
 
   return (
