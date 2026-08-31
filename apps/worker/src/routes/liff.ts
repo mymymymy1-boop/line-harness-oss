@@ -257,6 +257,9 @@ liffRoutes.get('/auth/line', async (c) => {
   const qrParams = new URLSearchParams();
   if (liffIdMatch) qrParams.set('liffId', liffIdMatch[1]);
   if (externalRef) qrParams.set('ref', externalRef);
+  // b: 本コード。QRとモバイルのLIFF遷移はこの qrParams だけを見るので、
+  // ここに入れないとPCからの登録は「どの本から来たか」を落とす（2026-08-31 実障害）。
+  if (bookParam) qrParams.set('b', bookParam);
   if (formId) qrParams.set('form', formId);
   if (gateParam) qrParams.set('gate', gateParam);
   if (xhParam2) qrParams.set('xh', xhParam2);
