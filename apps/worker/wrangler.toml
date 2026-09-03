@@ -8,6 +8,10 @@ account_id = "bf4d6f5cd8caf5fbb0a20c6841c5de38"
 [vars]
 # Kindle Factory の登録計測 webhook。本ごとのLINE登録を Kindle 側 /analytics に集計する。
 KINDLE_TRACK_URL = "https://kindle.bizsp.net/track/register"
+# 本コード→本タイトル解決API (Gmail通知の表示用。未デプロイ/失敗時はコード表示にフォールバック)
+KINDLE_RESOLVE_URL = "https://kindle.bizsp.net/track/resolve"
+# 新規友だち登録のGmail通知の宛先
+NOTIFY_EMAIL_TO = "mymymymy1@gmail.com"
 
 [assets]
 directory = "dist/client"

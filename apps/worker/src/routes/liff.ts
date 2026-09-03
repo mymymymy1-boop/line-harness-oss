@@ -803,6 +803,8 @@ liffRoutes.get('/auth/callback', async (c) => {
 
     // Save ad click IDs + UTM to friend metadata (for future ad API postback)
     const adMeta: Record<string, string> = {};
+    // Kindle 本コードも友だちレコードに永続化(どの本から登録されたかを友だち単位で追える)
+    if (kindleRef) adMeta.book_code = kindleRef;
     if (gclid) adMeta.gclid = gclid;
     if (fbclid) adMeta.fbclid = fbclid;
     if (twclid) adMeta.twclid = twclid;
@@ -816,7 +818,10 @@ liffRoutes.get('/auth/callback', async (c) => {
         .prepare('SELECT metadata FROM friends WHERE id = ?')
         .bind(friend.id)
         .first<{ metadata: string }>();
-      const merged = { ...JSON.parse(existingMeta?.metadata || '{}'), ...adMeta };
+      const existingObj = JSON.parse(existingMeta?.metadata || '{}') as Record<string, unknown>;
+      // book_code は first touch wins (ref_code と同じ流儀: 2冊目の本からの再登録で上書きしない)
+      if (existingObj.book_code) delete adMeta.book_code;
+      const merged = { ...existingObj, ...adMeta };
       await db
         .prepare('UPDATE friends SET metadata = ?, updated_at = ? WHERE id = ?')
         .bind(JSON.stringify(merged), jstNow(), friend.id)
@@ -1277,6 +1282,25 @@ liffRoutes.post('/api/liff/link', async (c) => {
             }
           }).catch((err) => console.error('Kindle track notify error (liff):', err))
         );
+      }
+      // 本コードを友だちレコードにも永続化 (first touch wins)
+      if (kindleRef) {
+        try {
+          const existingMeta = await db
+            .prepare('SELECT metadata FROM friends WHERE id = ?')
+            .bind(friend.id)
+            .first<{ metadata: string }>();
+          const meta = JSON.parse(existingMeta?.metadata || '{}') as Record<string, unknown>;
+          if (!meta.book_code) {
+            meta.book_code = kindleRef;
+            await db
+              .prepare('UPDATE friends SET metadata = ? WHERE id = ?')
+              .bind(JSON.stringify(meta), friend.id)
+              .run();
+          }
+        } catch (err) {
+          console.error('book_code persist failed (liff):', err);
+        }
       }
     }
 

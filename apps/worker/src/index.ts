@@ -62,6 +62,11 @@ export type Env = {
     IG_HARNESS_URL?: string;  // Optional: IG Harness API URL for cross-platform linking
     IG_HARNESS_LINK_SECRET?: string;  // Shared secret for IG Harness link-line webhook
     KINDLE_TRACK_URL?: string;  // Optional: Kindle Factory の登録計測 webhook (本ごとのLINE登録帰属)
+    KINDLE_RESOLVE_URL?: string;  // Optional: 本コード→タイトル解決API (メール通知の表示用)
+    GMAIL_CLIENT_ID?: string;  // Gmail通知: Google OAuthクライアント (secret)
+    GMAIL_CLIENT_SECRET?: string;  // Gmail通知 (secret)
+    GMAIL_REFRESH_TOKEN?: string;  // Gmail通知: gmail.send スコープ (secret)
+    NOTIFY_EMAIL_TO?: string;  // Gmail通知の宛先アドレス
     MAX_SENDS_PER_CRON?: string;  // Optional: override step delivery throughput per cron tick (CF Free=40, Paid=150-300)
     STRIPE_SECRET_KEY?: string;
     STRIPE_PUBLISHABLE_KEY?: string;
@@ -385,6 +390,14 @@ async function scheduled(
     await processDuplicateDetection(env.DB);
   } catch (e) {
     console.error('Duplicate detection error:', e);
+  }
+
+  // 新規友だち登録の Gmail 通知 (未通知ぶんをまとめて1通)
+  try {
+    const { processFriendEmailNotifications } = await import('./services/friend-email-notify.js');
+    await processFriendEmailNotifications(env);
+  } catch (e) {
+    console.error('Friend email notify error:', e);
   }
 }
 
