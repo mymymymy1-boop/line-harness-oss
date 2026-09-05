@@ -197,6 +197,21 @@ async function handleEvent(
 
     const postbackData = (event as unknown as { postback: { data: string } }).postback.data;
 
+    // 受信postbackもmessages_logへ記録する。Flexボタン連鎖（出版診断等）の到達計測は
+    // この行が唯一のデータ源（postbackはLINE側からmessageイベントとして届かない）。
+    // ログ失敗で応答を止めない。
+    try {
+      await db
+        .prepare(
+          `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, created_at)
+           VALUES (?, ?, 'incoming', 'postback', ?, NULL, NULL, ?)`,
+        )
+        .bind(crypto.randomUUID(), friend.id, postbackData, jstNow())
+        .run();
+    } catch (logErr) {
+      console.error('postback messages_log insert failed:', logErr);
+    }
+
     // Match postback data against auto_replies (exact match on keyword)
     const autoReplyQuery = lineAccountId
       ? `SELECT * FROM auto_replies WHERE is_active = 1 AND (line_account_id IS NULL OR line_account_id = ?) ORDER BY created_at ASC`
